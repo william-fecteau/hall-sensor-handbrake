@@ -54,6 +54,7 @@
   body[data-state="waiting"] #v-waiting,
   body[data-state="resting"] #v-resting,
   body[data-state="calibrating"] #v-calibrating,
+  body[data-state="finishing"] #v-finishing,
   body[data-state="ready"] #v-ready { display: block; }
   body[data-state="disconnected"] #sensors-card { display: none; }
   .alert {
@@ -123,7 +124,7 @@
   <section class="card view" id="v-disconnected">
     <h2>Connect the handbrake</h2>
     <p id="connect-help">Plug it in, click <b>Connect</b> and pick the CircuitPython serial port.
-      Close test.bash or any other serial monitor first: only one program can use the port.</p>
+      Only one program can use the port, so close any serial monitor first (Mu, Thonny, test.bash…).</p>
     <div class="alert" id="connect-error" hidden></div>
   </section>
 
@@ -131,6 +132,7 @@
     <h2>No status from the board</h2>
     <p>The port is open but the handbrake code is not reporting. It may have stopped
       (error or Ctrl+C). Restart it, or check the board messages below.</p>
+    <div class="alert" id="board-error" hidden></div>
     <button class="restart">Restart code</button>
   </section>
 
@@ -163,6 +165,11 @@
         <div class="pulls" id="pulls"></div>
       </div>
     </div>
+  </section>
+
+  <section class="card view" id="v-finishing">
+    <h2>Processing calibration…</h2>
+    <p>This takes a few seconds. You can let go of the handbrake.</p>
   </section>
 
   <section class="card view" id="v-ready">
@@ -207,6 +214,8 @@
 const CIRCUITPY_VID = 0x239a;
 const TRACE_SAMPLES = 300;     // 30 s at the board's 10 status lines per second
 const SILENT_AFTER_MS = 2500;
+const FINISHING_SILENT_AFTER_MS = 15000;  // the board prints nothing while it computes
+const PHASE_SETTLE_LINES = 3;             // a new phase must last 0.3 s to change the text
 const LOG_LINES = 200;
 
 const $ = (sel) => document.querySelector(sel);
@@ -326,6 +335,14 @@ function handleLine(raw) {
       status('resting');
       $('#failure').hidden = true;
       calTotal = 30;
+      shownPhase = null;
+      break;
+    case 'finishing':
+      status('finishing');
+      break;
+    case 'Traceback':
+    case 'soft':  // "soft reboot": the code restarted, any earlier error is gone
+      $('#board-error').hidden = true;
       break;
     case 'failed':
       $('#failure').textContent = 'Calibration failed: ' + fields.join(' ') + '. Try again, pulling all the way.';
@@ -334,6 +351,11 @@ function handleLine(raw) {
     case 'calibrated':
       $('#summary').textContent = 'Calibrated (' + fields.join(' ') + ')';
       break;
+  }
+  // Last line of a Python traceback, e.g. "MemoryError: memory allocation failed".
+  if (/^\w+(Error|Exception|Interrupt)\b/.test(line)) {
+    $('#board-error').textContent = 'The board reported: ' + line;
+    $('#board-error').hidden = false;
   }
   log(line);
 }
@@ -344,7 +366,8 @@ function status(state) {
 }
 
 setInterval(() => {
-  if (port && performance.now() - lastStatusAt > SILENT_AFTER_MS) setState('silent');
+  const limit = document.body.dataset.state === 'finishing' ? FINISHING_SILENT_AFTER_MS : SILENT_AFTER_MS;
+  if (port && performance.now() - lastStatusAt > limit) setState('silent');
 }, 500);
 
 // ---- Calibration -----------------------------------------------------------
@@ -358,11 +381,30 @@ const INSTRUCTIONS = {
 };
 const GOAL_PULLS = 3;
 
-function showProgress(remaining, phase, pulls) {
+// Debounce: the instruction follows the board's phase only once a new phase
+// has been reported PHASE_SETTLE_LINES times in a row.
+let shownPhase = null, nextPhase = null, nextPhaseCount = 0;
+
+function settledPhase(phase) {
+  if (phase === shownPhase || shownPhase === null) {
+    shownPhase = phase;
+    nextPhase = null;
+  } else if (phase !== nextPhase) {
+    nextPhase = phase;
+    nextPhaseCount = 1;
+  } else if (++nextPhaseCount >= PHASE_SETTLE_LINES) {
+    shownPhase = phase;
+    nextPhase = null;
+  }
+  return shownPhase;
+}
+
+function showProgress(remaining, reportedPhase, pulls) {
   calTotal = Math.max(calTotal, remaining);
   $('#remaining').textContent = Math.ceil(remaining);
   $('#ring-fg').style.strokeDashoffset = (263.9 * (1 - remaining / calTotal)).toFixed(1);
 
+  const phase = settledPhase(reportedPhase);
   let [text, sub] = INSTRUCTIONS[phase] || [phase, ''];
   if (phase === 'rest' && pulls > 0) text = pulls >= GOAL_PULLS ? 'Nice — pull again if you like' : 'Pull again, slowly';
   $('#instruction').textContent = text;

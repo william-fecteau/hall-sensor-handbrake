@@ -21,7 +21,7 @@
 #        waiting <s1> <s2> <s3>
 #        progress <seconds left> <phase> <pulls> <s1> <s2> <s3>
 #        pos <s1> <s2> <s3> <percent> <button 0/1>
-#   out, once: resting | calibrated <summary> | failed <reason>
+#   out, once: resting | finishing | calibrated <summary> | failed <reason>
 #   phase: settling, rest, pulling, held, releasing
 import math
 import struct
@@ -47,8 +47,9 @@ REST_READINGS = 50       # averaged at power-up, handbrake untouched
 START_MOVE = 600         # raw distance from rest that starts calibration
 LEAD_IN = 20             # readings kept from just before the movement started
 CALIBRATION_TIME = 30
-HOLD_TIME = 0.6          # seconds on the same node = held still, for the phase
+REST_RETURN = 450        # back at rest below this (leaving it takes START_MOVE)
 DUMP_CALIBRATION = True  # print every calibration reading, for tuning
+LIVE_SMOOTHING = 0.5     # weight of a new reading in the live moving average
 
 AXIS_MAX = 32767
 BUTTON_PRESS_AT = 0.6    # button 1 too, for games without axis support
@@ -154,7 +155,7 @@ def calibrate(start_now=False):
             calibrator.add(values)
 
         # Phase tracking, only for the instructions shown by the UI.
-        node, node_since = calibrator.node, time.monotonic()
+        at_rest = True
         was_held = False
         pulls = 0
 
@@ -169,15 +170,14 @@ def calibrate(start_now=False):
             if DUMP_CALIBRATION:
                 print("cal", values[0], values[1], values[2])
 
-            if calibrator.node != node:
-                node, node_since = calibrator.node, now
-            still = now - node_since >= HOLD_TIME
-            if distance(values, rest) < START_MOVE:
+            # Two thresholds, so noise around one cannot flip the phase.
+            at_rest = distance(calibrator.smooth, rest) < (START_MOVE if at_rest else REST_RETURN)
+            if at_rest:
                 if was_held:
                     pulls += 1
                     was_held = False
-                phase = "rest" if still else "settling"
-            elif still:
+                phase = "rest" if calibrator.still else "settling"
+            elif calibrator.still:
                 was_held = True
                 phase = "held"
             else:
@@ -190,6 +190,7 @@ def calibrate(start_now=False):
             time.sleep(LOOP_DELAY)
         set_led(False)
         print("samples:", calibrator.samples)
+        print("finishing")  # finish() takes 1-5 s, with nothing printed
         try:
             mapping = calibrator.finish()
         except ValueError as error:
@@ -203,6 +204,7 @@ mapping = calibrate()
 
 sent = None
 pressed = False
+smooth = None
 print_at = 0
 while True:
     if read_command() == "calibrate":
@@ -211,10 +213,15 @@ while True:
         mapping = calibrate(start_now=True)
         sent = None
         pressed = False
+        smooth = None
         continue
 
     values = read_all()
-    pos = mapping.position(values)
+    if smooth is None:
+        smooth = values
+    else:
+        smooth = [s + (v - s) * LIVE_SMOOTHING for s, v in zip(smooth, values)]
+    pos = mapping.position(smooth)
     axis = int(pos * AXIS_MAX)
 
     if not pressed and pos > BUTTON_PRESS_AT:

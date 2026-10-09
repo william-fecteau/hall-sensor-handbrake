@@ -1,27 +1,40 @@
 # Maps 3 Hall sensor readings to a 0..1 handbrake position.
 #
-# The sensors are not monotonic: as the magnet passes them, readings dip and
-# come back, so "distance from rest" is not a usable position. Instead, the
-# calibration records the path the readings trace in 3D while the brake is
-# pulled, and the position is how far along that path a reading sits.
+# The 3 sensors sit in a line along the magnet's travel, so their readings
+# change in turn as the magnet passes each one (order s2, s3, s1 when pulling).
+# Two things rule out a simple formula:
+# - readings are not monotonic: each sensor dips as the magnet goes by;
+# - the lever's play changes the magnet's gap, so pulling and releasing trace
+#   different paths in 3D: releasing passes closer, with dips ~3x deeper.
 #
-# Recording: samples are clustered into nodes (any sample within NODE_SIZE of
-# an existing node joins it). Consecutive samples in different nodes link those
-# nodes, which follows the real movement. Afterwards, the distance along those
-# links from the rest node gives each node its position on the path.
+# So the calibration learns both paths. It records the pulls, finds the two
+# ends (rest, measured before calibrating, and the end stop, where the brake
+# was held still the longest), cuts the recording into pulls (rest -> end stop)
+# and releases (end stop -> rest), and averages each kind into a curve of
+# CURVE_POINTS points spread evenly along its length. A live reading's position
+# is where it projects onto the nearer curve: 0 at rest, 1 at the end stop.
+#
+# Memory: everything big is allocated once, in Calibrator(). Growing lists and
+# dicts during the recording fragments CircuitPython's small heap until an
+# allocation fails with MemoryError, even with 100 KB free.
 #
 # Pure Python so it runs on CircuitPython and can be tested on a PC.
 import math
 from array import array
 
-NODE_SIZE = 200      # raw units; must stay above sensor noise (~150)
-MAX_NODES = 300
-NEIGHBOR_LINK = 2    # also link nodes closer than NEIGHBOR_LINK * NODE_SIZE
-MAX_STEP = 4         # ignore jumps longer than MAX_STEP * NODE_SIZE between
-                     # samples: a fast flick would shortcut across the path
-DWELL_SAMPLES = 30   # same node this many samples in a row = brake held still
-REST_ZONE_MAX = 0.3  # held-still spots below this fraction of the path = rest
-NEAREST = 3          # nodes blended when mapping a live reading
+MAX_SAMPLES = 4000   # 30 s at ~120 Hz; later samples are ignored
+CURVE_POINTS = 24    # points per learned curve, between rest and end stop
+WINDOW = 2           # recording smoothed over 2 * WINDOW + 1 samples
+GATE = 150           # raw units; points closer than this are merged before
+                     # measuring a path's length, or noise would add to it
+ZONE = 400           # raw units around rest / end stop that count as there
+STILL_SMOOTHING = 0.2  # weight of a new reading in the stillness average
+STILL_RADIUS = 400   # raw units; moving less than this = held still
+HOLD_SAMPLES = 40    # samples held still (~0.4 s) to count as a hold
+MAX_HOLDS = 8        # distinct places where the brake was held
+DEAD_ZONE = 0.04     # this close to either end reads exactly 0 or 1
+
+INF = float("inf")
 
 
 def _dist(a, b):
@@ -30,127 +43,188 @@ def _dist(a, b):
 
 class Calibrator:
     def __init__(self, rest):
-        self.nodes = [tuple(rest)]
-        self.links = {}
-        self.dwell = set()
+        self.rest = [float(r) for r in rest]
+        self.raw = array("H", (0 for _ in range(3 * MAX_SAMPLES)))
         self.samples = 0
-        self._current = 0
-        self._run = 0
+        # Stillness, also used by code.py for the UI's instructions.
+        self.smooth = list(self.rest)
+        self.still = False
+        self._anchor = list(self.rest)
+        self._still_for = 0
+        # Places held still away from rest: sum x, y, z and count each.
+        self._holds = array("f", (0 for _ in range(4 * MAX_HOLDS)))
+        self._hold_count = 0
 
     def add(self, values):
+        if self.samples < MAX_SAMPLES:
+            i = 3 * self.samples
+            self.raw[i], self.raw[i + 1], self.raw[i + 2] = values
         self.samples += 1
-        node = self._node_for(values)
-        if node == self._current:
-            self._run += 1
-            if self._run == DWELL_SAMPLES:
-                self.dwell.add(node)
-            return
-        self._link(self._current, node)
-        self._current = node
-        self._run = 1
 
-    @property
-    def node(self):
-        """Node the latest sample fell in; it stays the same while held still."""
-        return self._current
+        s = self.smooth
+        for k in range(3):
+            s[k] += (values[k] - s[k]) * STILL_SMOOTHING
+        if _dist(s, self._anchor) > STILL_RADIUS:
+            self._anchor[:] = s
+            self._still_for = 0
+        self._still_for += 1
+        self.still = self._still_for >= HOLD_SAMPLES
+        if self.still and _dist(s, self.rest) > ZONE:
+            self._add_hold(s)
 
-    def _node_for(self, values):
-        # Stay on the current node while close enough: keeps noise from
-        # flickering between two neighbors.
-        if _dist(values, self.nodes[self._current]) < NODE_SIZE:
-            return self._current
-        best, best_d = 0, None
-        for i, node in enumerate(self.nodes):
-            d = _dist(values, node)
-            if best_d is None or d < best_d:
-                best, best_d = i, d
-        if best_d < NODE_SIZE or len(self.nodes) >= MAX_NODES:
-            return best
-        self.nodes.append(tuple(values))
-        return len(self.nodes) - 1
+    def _add_hold(self, s):
+        holds = self._holds
+        for h in range(0, 4 * self._hold_count, 4):
+            n = holds[h + 3]
+            center = (holds[h] / n, holds[h + 1] / n, holds[h + 2] / n)
+            if _dist(center, s) < STILL_RADIUS:
+                break
+        else:
+            if self._hold_count == MAX_HOLDS:
+                return
+            h = 4 * self._hold_count
+            self._hold_count += 1
+        holds[h] += s[0]
+        holds[h + 1] += s[1]
+        holds[h + 2] += s[2]
+        holds[h + 3] += 1
 
-    def _link(self, a, b):
-        d = _dist(self.nodes[a], self.nodes[b])
-        if a != b and d < MAX_STEP * NODE_SIZE:
-            self.links[(min(a, b), max(a, b))] = d
+    def _smoothed(self, i):
+        """Recorded sample i, averaged with its neighbors (no lag)."""
+        n = min(self.samples, MAX_SAMPLES)
+        lo, hi = max(0, i - WINDOW), min(n, i + WINDOW + 1)
+        raw = self.raw
+        return [sum(raw[3 * j + k] for j in range(lo, hi)) / (hi - lo) for k in range(3)]
 
     def finish(self):
-        nodes = self.nodes
-        n = len(nodes)
-        for a in range(n):
-            for b in range(a + 1, n):
-                if _dist(nodes[a], nodes[b]) < NEIGHBOR_LINK * NODE_SIZE:
-                    self._link(a, b)
-
-        neighbors = [[] for _ in range(n)]
-        for (a, b), d in self.links.items():
-            neighbors[a].append((b, d))
-            neighbors[b].append((a, d))
-
-        # Dijkstra from the rest node (node 0). O(n^2) is fine for a few
-        # hundred nodes and needs no heapq, which CircuitPython lacks.
-        inf = float("inf")
-        along = [inf] * n
-        along[0] = 0.0
-        done = [False] * n
-        for _ in range(n):
-            u, best = -1, inf
-            for i in range(n):
-                if not done[i] and along[i] < best:
-                    u, best = i, along[i]
-            if u < 0:
-                break
-            done[u] = True
-            for v, d in neighbors[u]:
-                if best + d < along[v]:
-                    along[v] = best + d
-
-        reached = [i for i in range(n) if along[i] < inf]
-        full = max(along[i] for i in reached)
-        if full < 10 * NODE_SIZE:
+        # End stop: where the brake was held still the longest, away from rest.
+        holds = self._holds
+        best = -1
+        for h in range(0, 4 * self._hold_count, 4):
+            if best < 0 or holds[h + 3] > holds[best + 3]:
+                best = h
+        if best < 0:
+            raise ValueError("never held still away from rest: pull to the end stop and hold a second")
+        n = holds[best + 3]
+        end = [holds[best] / n, holds[best + 1] / n, holds[best + 2] / n]
+        if _dist(self.rest, end) < 3 * ZONE:
             raise ValueError("handbrake barely moved during calibration")
 
-        # Where the brake was held still tells where rest and full really are:
-        # rest drifts a little after each pull, and the hold at the end stop is
-        # slightly short of the farthest point a quick flick reaches.
-        held_low = [along[i] for i in self.dwell if along[i] < REST_ZONE_MAX * full]
-        held_high = [along[i] for i in self.dwell if full / 2 <= along[i] < inf]
-        low = max(held_low) + NODE_SIZE / 2 if held_low else NODE_SIZE
-        top = max(held_high) - NODE_SIZE / 2 if held_high else 0.95 * full
-        top = max(top, 0.75 * full)
+        # Cut the recording where it enters rest or end-stop zones, and learn
+        # from each crossing between the two.
+        curves = [_CurveSum(), _CurveSum()]  # pulls, releases
+        zone, zone_at = None, 0
+        for i in range(min(self.samples, MAX_SAMPLES)):
+            p = self._smoothed(i)
+            if _dist(p, self.rest) < ZONE:
+                here = 0
+            elif _dist(p, end) < ZONE:
+                here = 1
+            else:
+                continue
+            if zone is not None and here != zone:
+                curves[zone].add([self._smoothed(j) for j in range(zone_at, i + 1)], zone == 1)
+            zone, zone_at = here, i
+        learned = [c.curve(self.rest, end) for c in curves if c.count]
+        if not learned:
+            raise ValueError("no full pull: pull all the way to the end stop and release")
+        return Mapping(learned, curves[0].count, curves[1].count)
 
-        return Mapping(
-            [nodes[i] for i in reached], [along[i] for i in reached], low, top
-        )
+
+class _CurveSum:
+    """Sum of crossings, each resampled to CURVE_POINTS evenly spaced points."""
+
+    def __init__(self):
+        self.sums = [0.0] * (3 * CURVE_POINTS)
+        self.count = 0
+
+    def add(self, points, reverse):
+        if reverse:
+            points.reverse()
+        # Merge points closer than GATE, then measure the length along them.
+        kept = [points[0]]
+        for p in points[1:]:
+            if _dist(p, kept[-1]) >= GATE:
+                kept.append(p)
+        if kept[-1] is not points[-1]:
+            kept.append(points[-1])
+        if len(kept) < 3:
+            return  # too fast to follow: a few samples across the whole travel
+        along = [0.0]
+        for a, b in zip(kept, kept[1:]):
+            along.append(along[-1] + _dist(a, b))
+        total = along[-1]
+        seg = 0
+        for k in range(CURVE_POINTS):
+            target = total * k / (CURVE_POINTS - 1)
+            while seg < len(kept) - 2 and along[seg + 1] < target:
+                seg += 1
+            span = along[seg + 1] - along[seg]
+            u = (target - along[seg]) / span if span else 0.0
+            for c in range(3):
+                a = kept[seg][c]
+                self.sums[3 * k + c] += a + (kept[seg + 1][c] - a) * u
+        self.count += 1
+
+    def curve(self, rest, end):
+        """Averaged points from rest to end, with their 0..1 position."""
+        points = [rest]
+        for k in range(CURVE_POINTS):
+            points.append([self.sums[3 * k + c] / self.count for c in range(3)])
+        points.append(end)
+        along = [0.0]
+        for a, b in zip(points, points[1:]):
+            along.append(along[-1] + _dist(a, b))
+        coords = array("l", (int(round(v)) for p in points for v in p))
+        position = array("f", (a / along[-1] for a in along))
+        return coords, position
+
+
+def _project(coords, position, k, x, y, z):
+    """Squared distance to segment k of a curve, and the position there."""
+    i = 3 * k
+    ax, ay, az = coords[i], coords[i + 1], coords[i + 2]
+    bx, by, bz = coords[i + 3] - ax, coords[i + 4] - ay, coords[i + 5] - az
+    px, py, pz = x - ax, y - ay, z - az
+    length2 = bx * bx + by * by + bz * bz
+    u = (px * bx + py * by + pz * bz) / length2 if length2 else 0.0
+    u = min(1.0, max(0.0, u))
+    dx, dy, dz = px - u * bx, py - u * by, pz - u * bz
+    t = position[k] + u * (position[k + 1] - position[k])
+    return dx * dx + dy * dy + dz * dz, t
 
 
 class Mapping:
-    def __init__(self, nodes, along, low, top):
-        self.nodes = nodes
-        self.along = array("f", along)
-        self.low = low
-        self.top = top
+    def __init__(self, curves, pulls, releases):
+        self.curves = curves
+        self.pulls = pulls
+        self.releases = releases
+
+    def raw_position(self, values):
+        """0..1 along the nearest learned curve, without the dead zones.
+
+        Finds each curve's nearest point with integer math first, then projects
+        onto the two segments around it. On CircuitPython every float is an
+        allocation: projecting onto all segments took ~90 ms per reading."""
+        x, y, z = int(values[0]), int(values[1]), int(values[2])
+        best_d, best_t = INF, 0.0
+        for coords, position in self.curves:
+            nearest, nearest_d = 0, None
+            for i in range(0, len(coords), 3):
+                dx, dy, dz = x - coords[i], y - coords[i + 1], z - coords[i + 2]
+                d = dx * dx + dy * dy + dz * dz
+                if nearest_d is None or d < nearest_d:
+                    nearest, nearest_d = i // 3, d
+            for k in (nearest - 1, nearest):
+                if 0 <= k < len(position) - 1:
+                    d, t = _project(coords, position, k, x, y, z)
+                    if d < best_d:
+                        best_d, best_t = d, t
+        return best_t
 
     def position(self, values):
-        # Blend the positions of the nearest nodes, weighted by closeness.
-        nearest = []
-        for i, node in enumerate(self.nodes):
-            d = _dist(values, node)
-            if len(nearest) < NEAREST:
-                nearest.append((d, i))
-                nearest.sort()
-            elif d < nearest[-1][0]:
-                nearest[-1] = (d, i)
-                nearest.sort()
-        total = weight = 0.0
-        for d, i in nearest:
-            w = 1.0 / (d + 1.0)
-            total += w * self.along[i]
-            weight += w
-        pos = (total / weight - self.low) / (self.top - self.low)
+        pos = (self.raw_position(values) - DEAD_ZONE) / (1 - 2 * DEAD_ZONE)
         return min(1.0, max(0.0, pos))
 
     def summary(self):
-        return "nodes={} rest_zone={:.0f} full={:.0f} path={:.0f}".format(
-            len(self.nodes), self.low, self.top, max(self.along)
-        )
+        return "pulls={} releases={}".format(self.pulls, self.releases)

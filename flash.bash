@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Flashes the handbrake code to the nRF52840-MDK.
 #
-#   ./flash.bash             copy src/*.py to the CIRCUITPY drive (changed files only)
+#   ./flash.bash             copy src/*.py and the UI (as Handbrake.html) to the
+#                            CIRCUITPY drive (changed files only)
 #   ./flash.bash --reset     same, then always hard-reset the board
 #   ./flash.bash --firmware  first flash CircuitPython + S140 through the DAPLINK
 #                            drive, then copy src/*.py
@@ -15,8 +16,15 @@ cd "$(dirname "$0")"
 
 FIRMWARE=firmware/circuitpython-10.3.1-with-s140.hex
 DAPLINK_VID=0D28
-# code.py last: saving it triggers the auto-reload, so everything else must be there.
-FILES=(src/calibration.py src/boot.py src/code.py)
+# source:name on the board. code.py last: saving it triggers the auto-reload,
+# so everything else must be there. The UI rides along so that anyone with the
+# handbrake can open it from the drive, no repo needed.
+FILES=(
+    ui/index.html:Handbrake.html
+    src/calibration.py:calibration.py
+    src/boot.py:boot.py
+    src/code.py:code.py
+)
 
 is_windows() {
     case "$(uname -s)" in MINGW* | MSYS* | CYGWIN*) return 0 ;; *) return 1 ;; esac
@@ -109,7 +117,7 @@ for arg in "$@"; do
     --firmware) firmware=true ;;
     --reset) force_reset=true ;;
     -h | --help)
-        sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+        sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
         exit 0
         ;;
     *)
@@ -129,14 +137,14 @@ circuitpy=$(wait_for_drive CIRCUITPY 30) || {
 echo "Board: $(head -n 1 "$circuitpy/boot_out.txt" 2>/dev/null || echo unknown) at $circuitpy"
 
 changed=()
-for file in "${FILES[@]}"; do
-    target=$circuitpy/$(basename "$file")
-    if cmp -s "$file" "$target"; then
-        echo "  unchanged  $(basename "$file")"
+for entry in "${FILES[@]}"; do
+    file=${entry%%:*} name=${entry#*:}
+    if cmp -s "$file" "$circuitpy/$name"; then
+        echo "  unchanged  $name"
     else
-        cp "$file" "$target"
-        echo "  copied     $(basename "$file")"
-        changed+=("$(basename "$file")")
+        cp "$file" "$circuitpy/$name"
+        echo "  copied     $name"
+        changed+=("$name")
     fi
 done
 sync
