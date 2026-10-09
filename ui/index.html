@@ -62,6 +62,7 @@
     background: color-mix(in srgb, var(--danger) 8%, transparent); border-radius: 4px;
   }
   .alert[hidden] { display: none; }
+  #failure { margin-bottom: 12px; }
 
   /* Calibration */
   .cal { display: flex; gap: 20px; align-items: center; }
@@ -136,11 +137,13 @@
     <button class="restart">Restart code</button>
   </section>
 
+  <div class="alert" id="failure" hidden></div>
+
   <section class="card view" id="v-waiting">
-    <h2>Ready to calibrate</h2>
-    <div class="alert" id="failure" hidden></div>
+    <h2>Not calibrated yet</h2>
     <p>Leave the handbrake fully released, then click <b>Calibrate</b>.
-      You'll then have 30 seconds to pull it slowly all the way a few times.</p>
+      You'll then have 30 seconds to pull it slowly all the way a few times.
+      The calibration is saved on the handbrake: you only do this once.</p>
     <button class="calibrate">Calibrate</button>
   </section>
 
@@ -188,7 +191,7 @@
 
     <hr class="sep">
     <div class="row">
-      <span class="muted" id="summary"></span>
+      <span class="muted" id="summary">Check it: 0% released, 100% at the end stop.</span>
       <button class="calibrate ghost">Recalibrate</button>
     </div>
   </section>
@@ -345,11 +348,15 @@ function handleLine(raw) {
       $('#board-error').hidden = true;
       break;
     case 'failed':
-      $('#failure').textContent = 'Calibration failed: ' + fields.join(' ') + '. Try again, pulling all the way.';
+      $('#failure').textContent = 'Calibration failed: ' + fields.join(' ') +
+        '. Any previous calibration is still in use. Try again, holding a second at the end stop.';
       $('#failure').hidden = false;
       break;
     case 'calibrated':
-      $('#summary').textContent = 'Calibrated (' + fields.join(' ') + ')';
+      $('#summary').textContent = 'New calibration saved (' + fields.join(' ') + '). Check it: 0% released, 100% at the end stop.';
+      break;
+    case 'loaded':
+      $('#summary').textContent = 'Using the saved calibration. Check it: 0% released, 100% at the end stop.';
       break;
   }
   // Last line of a Python traceback, e.g. "MemoryError: memory allocation failed".

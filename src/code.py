@@ -1,5 +1,8 @@
-# Handbrake, stage 2: Hall sensors -> progressive axis, calibrated at power-up
-# (or at any time from ui/index.html).
+# Handbrake, stage 2: Hall sensors -> progressive axis.
+#
+# The calibration is saved in the board's non-volatile memory (nvm) and reused
+# at power-up. Recalibrate from ui/index.html (Handbrake.html on the drive).
+# With nothing saved yet, pulling the handbrake starts a calibration too.
 #
 # Wiring (sensors powered from 3.3V, never 5V):
 #   sensor 1 signal -> P0.02 (AIN0)
@@ -7,13 +10,13 @@
 #   sensor 3 signal -> P0.28 (AIN4)
 #
 # Green LED:
-#   blinking -> plugged in, waiting: pull the handbrake to start calibrating
+#   blinking -> no calibration saved: pull the handbrake to start calibrating
 #   solid    -> calibrating for 30 s: pull slowly all the way, hold a second
 #               at the end, release fully, wait a second, repeat
 #   off      -> ready; lights only while the handbrake is at 100%
 #
-# Leave the handbrake released when plugging in: the resting position is
-# measured while the LED blinks.
+# Leave the handbrake released when a calibration starts: the resting position
+# is measured just before.
 #
 # Serial protocol, used by ui/index.html (other lines are for humans):
 #   in:  "calibrate"  measure rest now and calibrate (at any time)
@@ -22,6 +25,8 @@
 #        progress <seconds left> <phase> <pulls> <s1> <s2> <s3>
 #        pos <s1> <s2> <s3> <percent> <button 0/1>
 #   out, once: resting | finishing | calibrated <summary> | failed <reason>
+#              | loaded <summary> (saved calibration, at power-up)
+#   A failed calibration keeps the previous one, if any.
 #   phase: settling, rest, pulling, held, releasing
 import math
 import struct
@@ -31,10 +36,11 @@ import time
 import analogio
 import board
 import digitalio
+import microcontroller
 import supervisor
 import usb_hid
 
-from calibration import Calibrator
+from calibration import Calibrator, Mapping
 
 SENSOR_PINS = (board.AIN0, board.AIN1, board.AIN4)
 
@@ -144,7 +150,8 @@ def wait_for_start():
         time.sleep(LOOP_DELAY)
 
 
-def calibrate(start_now=False):
+def calibrate(start_now=False, previous=None):
+    """Returns a new mapping, or previous if there is one and calibrating failed."""
     while True:
         rest, recent = rest_now() if start_now else wait_for_start()
         start_now = False
@@ -195,12 +202,40 @@ def calibrate(start_now=False):
             mapping = calibrator.finish()
         except ValueError as error:
             print("failed", error)
+            if previous:
+                return previous
             continue
         print("calibrated", mapping.summary())
+        save_calibration(mapping)
         return mapping
 
 
-mapping = calibrate()
+def save_calibration(mapping):
+    data = mapping.to_bytes()
+    if len(data) > len(microcontroller.nvm):
+        print("calibration too big to save:", len(data), "bytes")
+        return
+    # Only rewrite flash when it changed (flash wears out with writes).
+    if microcontroller.nvm[0:len(data)] != data:
+        microcontroller.nvm[0:len(data)] = data
+    print("saved", len(data), "bytes")
+
+
+def load_calibration():
+    try:
+        return Mapping.from_bytes(microcontroller.nvm)
+    except (ValueError, RuntimeError) as error:
+        print("no saved calibration:", error)
+        return None
+
+
+# A saved calibration is used as is: recalibrating then only happens on
+# request ("calibrate" from the UI), never by pulling the handbrake.
+mapping = load_calibration()
+if mapping:
+    print("loaded", mapping.summary())
+else:
+    mapping = calibrate()
 
 sent = None
 pressed = False
@@ -210,7 +245,7 @@ while True:
     if read_command() == "calibrate":
         send(0, False)
         set_led(False)
-        mapping = calibrate(start_now=True)
+        mapping = calibrate(start_now=True, previous=mapping)
         sent = None
         pressed = False
         smooth = None

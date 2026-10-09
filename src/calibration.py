@@ -20,6 +20,7 @@
 #
 # Pure Python so it runs on CircuitPython and can be tested on a PC.
 import math
+import struct
 from array import array
 
 MAX_SAMPLES = 4000   # 30 s at ~120 Hz; later samples are ignored
@@ -33,6 +34,9 @@ STILL_RADIUS = 400   # raw units; moving less than this = held still
 HOLD_SAMPLES = 40    # samples held still (~0.4 s) to count as a hold
 MAX_HOLDS = 8        # distinct places where the brake was held
 DEAD_ZONE = 0.04     # this close to either end reads exactly 0 or 1
+
+SAVE_MAGIC = b"HBK1"  # change when the saved format or its meaning changes
+SAVE_HEADER = "<4sBHH"
 
 INF = float("inf")
 
@@ -228,3 +232,34 @@ class Mapping:
 
     def summary(self):
         return "pulls={} releases={}".format(self.pulls, self.releases)
+
+    # Saved format: SAVE_HEADER, then per curve its point count (H), the
+    # points' x, y, z (l each) and their positions (f each). Little endian.
+    def to_bytes(self):
+        parts = [struct.pack(SAVE_HEADER, SAVE_MAGIC, len(self.curves), self.pulls, self.releases)]
+        for coords, position in self.curves:
+            n = len(position)
+            parts.append(struct.pack("<H", n))
+            parts.append(struct.pack("<{}l".format(3 * n), *coords))
+            parts.append(struct.pack("<{}f".format(n), *position))
+        return b"".join(parts)
+
+    @staticmethod
+    def from_bytes(data):
+        """Reads what to_bytes() wrote; ValueError if data holds no calibration."""
+        at = struct.calcsize(SAVE_HEADER)
+        magic, count, pulls, releases = struct.unpack(SAVE_HEADER, bytes(data[0:at]))
+        if magic != SAVE_MAGIC or not 1 <= count <= 2:
+            raise ValueError("no saved calibration")
+        curves = []
+        for _ in range(count):
+            n = struct.unpack("<H", bytes(data[at:at + 2]))[0]
+            at += 2
+            size = 16 * n
+            if not 2 <= n <= CURVE_POINTS + 2 or at + size > len(data):
+                raise ValueError("saved calibration is damaged")
+            coords = array("l", struct.unpack("<{}l".format(3 * n), bytes(data[at:at + 12 * n])))
+            position = array("f", struct.unpack("<{}f".format(n), bytes(data[at + 12 * n:at + size])))
+            curves.append((coords, position))
+            at += size
+        return Mapping(curves, pulls, releases)
