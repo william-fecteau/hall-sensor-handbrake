@@ -49,6 +49,11 @@ class Calibrator:
         self._current = node
         self._run = 1
 
+    @property
+    def node(self):
+        """Node the latest sample fell in; it stays the same while held still."""
+        return self._current
+
     def _node_for(self, values):
         # Stay on the current node while close enough: keeps noise from
         # flickering between two neighbors.

@@ -1,0 +1,524 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Handbrake Calibrator</title>
+<!--
+  Talks to the handbrake over its serial port (Web Serial: Chrome or Edge only)
+  and reads it as a game controller (Gamepad API) to check what games see.
+  The serial protocol is described at the top of src/code.py.
+  Only one program can use the serial port: close test.bash, Mu or Thonny first.
+-->
+<style>
+  :root {
+    --bg: #f5f6f8; --surface: #ffffff; --text: #171a20; --muted: #5d6573;
+    --border: #e1e4ea; --track: #eceef2; --accent: #2457d6; --accent-text: #ffffff;
+    --ok: #15803d; --warn: #b45309; --danger: #c62828;
+    --s1: #2457d6; --s2: #c2367a; --s3: #0f8a7e;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #111317; --surface: #1a1d23; --text: #e8eaee; --muted: #9aa2b1;
+      --border: #2c313a; --track: #262a32; --accent: #6b93ff; --accent-text: #0d1220;
+      --ok: #4ade80; --warn: #fbbf24; --danger: #f87171;
+      --s1: #6b93ff; --s2: #f472b6; --s3: #2dd4bf;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main { max-width: 560px; margin: 0 auto; padding: 20px 16px 40px; }
+  header { display: flex; align-items: center; gap: 10px; margin-bottom: 16px; }
+  h1 { font-size: 18px; margin: 0; flex: 1; }
+  .status { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  .status.on .dot { background: var(--ok); }
+  .card {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+    padding: 20px; margin-bottom: 12px;
+  }
+  .card h2 { font-size: 20px; margin: 0 0 6px; }
+  .card p { margin: 0 0 14px; color: var(--muted); }
+  button {
+    font: inherit; font-weight: 600; border-radius: 8px; padding: 9px 16px; cursor: pointer;
+    border: 1px solid var(--accent); background: var(--accent); color: var(--accent-text);
+  }
+  button.ghost { background: transparent; color: var(--text); border-color: var(--border); font-weight: 500; }
+  button:disabled { opacity: .5; cursor: default; }
+  .view { display: none; }
+  body[data-state="disconnected"] #v-disconnected,
+  body[data-state="silent"] #v-silent,
+  body[data-state="waiting"] #v-waiting,
+  body[data-state="resting"] #v-resting,
+  body[data-state="calibrating"] #v-calibrating,
+  body[data-state="ready"] #v-ready { display: block; }
+  body[data-state="disconnected"] #sensors-card { display: none; }
+  .alert {
+    border-left: 3px solid var(--danger); padding: 8px 12px; margin: 0 0 14px;
+    background: color-mix(in srgb, var(--danger) 8%, transparent); border-radius: 4px;
+  }
+  .alert[hidden] { display: none; }
+
+  /* Calibration */
+  .cal { display: flex; gap: 20px; align-items: center; }
+  .ring { position: relative; width: 96px; height: 96px; flex: none; }
+  .ring svg { transform: rotate(-90deg); }
+  .ring .time {
+    position: absolute; inset: 0; display: grid; place-items: center;
+    font-size: 28px; font-weight: 700; font-variant-numeric: tabular-nums;
+  }
+  #instruction { font-size: 26px; font-weight: 700; line-height: 1.2; margin-bottom: 4px; }
+  #instruction-sub { color: var(--muted); margin-bottom: 12px; }
+  .pulls { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13px; }
+  .pulls i { width: 12px; height: 12px; border-radius: 50%; border: 2px solid var(--border); }
+  .pulls i.done { background: var(--ok); border-color: var(--ok); }
+  .phase-held #instruction, .phase-releasing #instruction { color: var(--ok); }
+
+  /* Live status */
+  .meter-row { display: grid; grid-template-columns: 1fr auto; align-items: baseline; margin-bottom: 6px; }
+  .big { font-size: 44px; font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1; }
+  .label { color: var(--muted); font-size: 13px; }
+  .bar { height: 14px; background: var(--track); border-radius: 7px; overflow: hidden; margin-bottom: 14px; }
+  .bar > div { height: 100%; width: 0; background: var(--accent); border-radius: 7px; transition: width .08s linear; }
+  .bar.full > div { background: var(--ok); }
+  .bar.small { height: 8px; }
+  .pill {
+    display: inline-flex; align-items: center; gap: 6px; font-size: 13px; padding: 3px 10px;
+    border-radius: 999px; border: 1px solid var(--border); color: var(--muted);
+  }
+  .pill.on { border-color: var(--ok); color: var(--ok); }
+  .pill .dot { width: 7px; height: 7px; }
+  .pill.on .dot { background: var(--ok); }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between; }
+  .sep { border: 0; border-top: 1px solid var(--border); margin: 16px 0; }
+  .muted { color: var(--muted); font-size: 13px; }
+  .mismatch { color: var(--warn); }
+
+  /* Sensors */
+  canvas { width: 100%; height: 110px; display: block; }
+  .legend { display: flex; gap: 14px; font-size: 13px; color: var(--muted); font-variant-numeric: tabular-nums; flex-wrap: wrap; }
+  .legend span::before {
+    content: ""; display: inline-block; width: 10px; height: 3px; border-radius: 2px;
+    margin-right: 6px; vertical-align: middle; background: var(--c);
+  }
+  details { margin-top: 4px; }
+  summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+  pre {
+    font: 12px/1.4 ui-monospace, Consolas, monospace; max-height: 220px; overflow: auto;
+    background: var(--track); padding: 10px; border-radius: 8px; white-space: pre-wrap; margin: 8px 0 0;
+  }
+</style>
+</head>
+<body data-state="disconnected">
+<main>
+  <header>
+    <h1>Handbrake</h1>
+    <div class="status" id="status"><span class="dot"></span><span id="status-text">Not connected</span></div>
+    <button id="connect">Connect</button>
+  </header>
+
+  <section class="card view" id="v-disconnected">
+    <h2>Connect the handbrake</h2>
+    <p id="connect-help">Plug it in, click <b>Connect</b> and pick the CircuitPython serial port.
+      Close test.bash or any other serial monitor first: only one program can use the port.</p>
+    <div class="alert" id="connect-error" hidden></div>
+  </section>
+
+  <section class="card view" id="v-silent">
+    <h2>No status from the board</h2>
+    <p>The port is open but the handbrake code is not reporting. It may have stopped
+      (error or Ctrl+C). Restart it, or check the board messages below.</p>
+    <button class="restart">Restart code</button>
+  </section>
+
+  <section class="card view" id="v-waiting">
+    <h2>Ready to calibrate</h2>
+    <div class="alert" id="failure" hidden></div>
+    <p>Leave the handbrake fully released, then click <b>Calibrate</b>.
+      You'll then have 30 seconds to pull it slowly all the way a few times.</p>
+    <button class="calibrate">Calibrate</button>
+  </section>
+
+  <section class="card view" id="v-resting">
+    <h2>Measuring rest position…</h2>
+    <p>Don't touch the handbrake.</p>
+  </section>
+
+  <section class="card view" id="v-calibrating">
+    <div class="cal">
+      <div class="ring">
+        <svg width="96" height="96" viewBox="0 0 96 96" aria-hidden="true">
+          <circle cx="48" cy="48" r="42" fill="none" stroke="var(--track)" stroke-width="8"/>
+          <circle id="ring-fg" cx="48" cy="48" r="42" fill="none" stroke="var(--accent)" stroke-width="8"
+                  stroke-linecap="round" stroke-dasharray="263.9" stroke-dashoffset="0"/>
+        </svg>
+        <div class="time" id="remaining">30</div>
+      </div>
+      <div>
+        <div id="instruction">Wait a second</div>
+        <div id="instruction-sub">Let it rest, fully released</div>
+        <div class="pulls" id="pulls"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="card view" id="v-ready">
+    <div class="meter-row">
+      <div><div class="label">Handbrake</div><div class="big" id="pct">0%</div></div>
+      <span class="pill" id="button"><span class="dot"></span>Button 1</span>
+    </div>
+    <div class="bar" id="pct-bar"><div></div></div>
+
+    <div class="meter-row">
+      <div class="label">What games see (game controller)</div>
+      <span class="muted" id="pad-pct">–</span>
+    </div>
+    <div class="bar small" id="pad-bar"><div></div></div>
+    <div class="muted" id="pad-note">Move the handbrake: browsers only show a controller once it's been used.</div>
+
+    <hr class="sep">
+    <div class="row">
+      <span class="muted" id="summary"></span>
+      <button class="calibrate ghost">Recalibrate</button>
+    </div>
+  </section>
+
+  <section class="card" id="sensors-card">
+    <div class="row" style="margin-bottom:8px">
+      <div class="legend">
+        <span style="--c:var(--s1)" id="l1">Sensor 1</span>
+        <span style="--c:var(--s2)" id="l2">Sensor 2</span>
+        <span style="--c:var(--s3)" id="l3">Sensor 3</span>
+      </div>
+      <button class="restart ghost" title="Restart code.py (like Ctrl+D)">Restart code</button>
+    </div>
+    <canvas id="trace"></canvas>
+    <details>
+      <summary>Board messages</summary>
+      <pre id="log"></pre>
+    </details>
+  </section>
+</main>
+
+<script>
+const CIRCUITPY_VID = 0x239a;
+const TRACE_SAMPLES = 300;     // 30 s at the board's 10 status lines per second
+const SILENT_AFTER_MS = 2500;
+const LOG_LINES = 200;
+
+const $ = (sel) => document.querySelector(sel);
+const ANSI = /\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-9;]*[A-Za-z]/g;
+
+let port = null;
+let lastStatusAt = 0;
+let calTotal = 30;
+const trace = [[], [], []];
+const logLines = [];
+
+function setState(state) {
+  document.body.dataset.state = state;
+}
+
+function setConnected(on, text) {
+  $('#status').classList.toggle('on', on);
+  $('#status-text').textContent = text;
+  $('#connect').textContent = on ? 'Disconnect' : 'Connect';
+}
+
+// ---- Serial ---------------------------------------------------------------
+
+async function openPort(p) {
+  try {
+    await p.open({ baudRate: 115200 });
+  } catch (e) {
+    showConnectError(e.name === 'InvalidStateError'
+      ? 'The port is already open in another tab.'
+      : 'Could not open the port. Is test.bash, Mu or Thonny using it? (' + e.message + ')');
+    return;
+  }
+  port = p;
+  // CircuitPython only sends output once DTR is raised.
+  try { await p.setSignals({ dataTerminalReady: true, requestToSend: true }); } catch {}
+  $('#connect-error').hidden = true;
+  setConnected(true, 'Connected');
+  lastStatusAt = performance.now();
+  setState('connecting');  // no card until the first status line (or 'silent')
+  readLoop(p);
+}
+
+async function readLoop(p) {
+  const decoder = new TextDecoder();
+  let buffer = '';
+  while (port === p && p.readable) {
+    const reader = p.readable.getReader();
+    p.reader = reader;
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split(/\r?\n/);
+        buffer = lines.pop();
+        lines.forEach(handleLine);
+      }
+    } catch (e) {
+      // Device unplugged or reset: readable goes away and the loop ends.
+    } finally {
+      reader.releaseLock();
+    }
+  }
+  if (port === p) closePort();
+  try { await p.close(); } catch {}
+}
+
+// The read loop sees its reader cancelled, releases it and closes the port.
+function closePort() {
+  const p = port;
+  port = null;
+  setConnected(false, 'Not connected');
+  setState('disconnected');
+  p?.reader?.cancel().catch(() => {});
+}
+
+async function write(text) {
+  if (!port?.writable) return;
+  const writer = port.writable.getWriter();
+  try { await writer.write(new TextEncoder().encode(text)); } finally { writer.releaseLock(); }
+}
+
+function showConnectError(message) {
+  $('#connect-error').textContent = message;
+  $('#connect-error').hidden = false;
+}
+
+// ---- Protocol (see src/code.py) ---------------------------------------------
+
+function handleLine(raw) {
+  const line = raw.replace(ANSI, '').trim();
+  if (!line) return;
+  const [kind, ...fields] = line.split(/\s+/);
+  const n = fields.map(Number);
+
+  switch (kind) {
+    case 'cal':
+      return;  // raw calibration dump, too fast to be useful here
+    case 'waiting':
+      if (n.length !== 3 || n.some(isNaN)) break;
+      status('waiting');
+      addSample(n);
+      return;
+    case 'progress':
+      if (n.length !== 6) break;
+      status('calibrating');
+      showProgress(n[0], fields[1], n[2]);
+      addSample(n.slice(3));
+      return;
+    case 'pos':
+      if (n.length !== 5 || n.some(isNaN)) break;
+      status('ready');
+      showPosition(n[3], n[4] === 1);
+      addSample(n.slice(0, 3));
+      return;
+    case 'resting':
+      status('resting');
+      $('#failure').hidden = true;
+      calTotal = 30;
+      break;
+    case 'failed':
+      $('#failure').textContent = 'Calibration failed: ' + fields.join(' ') + '. Try again, pulling all the way.';
+      $('#failure').hidden = false;
+      break;
+    case 'calibrated':
+      $('#summary').textContent = 'Calibrated (' + fields.join(' ') + ')';
+      break;
+  }
+  log(line);
+}
+
+function status(state) {
+  lastStatusAt = performance.now();
+  if (document.body.dataset.state !== state) setState(state);
+}
+
+setInterval(() => {
+  if (port && performance.now() - lastStatusAt > SILENT_AFTER_MS) setState('silent');
+}, 500);
+
+// ---- Calibration -----------------------------------------------------------
+
+const INSTRUCTIONS = {
+  settling: ['Wait a second', 'Let it rest, fully released'],
+  rest: ['Pull slowly all the way', 'Then hold it a second at the end stop'],
+  pulling: ['Keep pulling to the end stop', 'Slowly, then hold it there'],
+  held: ['Now release fully', 'Good hold'],
+  releasing: ['Release all the way', 'Let it go back to rest'],
+};
+const GOAL_PULLS = 3;
+
+function showProgress(remaining, phase, pulls) {
+  calTotal = Math.max(calTotal, remaining);
+  $('#remaining').textContent = Math.ceil(remaining);
+  $('#ring-fg').style.strokeDashoffset = (263.9 * (1 - remaining / calTotal)).toFixed(1);
+
+  let [text, sub] = INSTRUCTIONS[phase] || [phase, ''];
+  if (phase === 'rest' && pulls > 0) text = pulls >= GOAL_PULLS ? 'Nice — pull again if you like' : 'Pull again, slowly';
+  $('#instruction').textContent = text;
+  $('#instruction-sub').textContent = sub;
+  $('#v-calibrating').className = 'card view phase-' + phase;
+
+  const dots = Array.from({ length: Math.max(GOAL_PULLS, pulls) },
+    (_, i) => `<i class="${i < pulls ? 'done' : ''}"></i>`).join('');
+  $('#pulls').innerHTML = dots + `<span>${pulls} pull${pulls === 1 ? '' : 's'}</span>`;
+}
+
+// ---- Live position ---------------------------------------------------------
+
+let boardPct = 0;
+
+function showPosition(pct, pressed) {
+  boardPct = pct;
+  $('#pct').textContent = pct + '%';
+  $('#pct-bar').firstElementChild.style.width = pct + '%';
+  $('#pct-bar').classList.toggle('full', pct >= 100);
+  $('#button').classList.toggle('on', pressed);
+}
+
+// The board reports itself as a joystick with one axis (Z). Which index the
+// browser gives that axis varies, so use the one that has moved the most.
+const axisRange = new Map();
+
+function findPad() {
+  const pads = [...navigator.getGamepads()].filter(Boolean);
+  return pads.find((p) => p.id.toLowerCase().includes('239a')) ||
+         pads.find((p) => /circuitpython|handbrake/i.test(p.id));
+}
+
+function pollGamepad() {
+  requestAnimationFrame(pollGamepad);
+  if (document.body.dataset.state !== 'ready') return;
+  const pad = findPad();
+  if (!pad || !pad.axes.length) {
+    $('#pad-pct').textContent = '–';
+    $('#pad-note').hidden = false;
+    return;
+  }
+  let best = Math.min(2, pad.axes.length - 1), bestRange = 0.05;
+  pad.axes.forEach((v, i) => {
+    const r = axisRange.get(i) || { min: v, max: v };
+    r.min = Math.min(r.min, v); r.max = Math.max(r.max, v);
+    axisRange.set(i, r);
+    if (r.max - r.min > bestRange) { best = i; bestRange = r.max - r.min; }
+  });
+  const pct = Math.round((pad.axes[best] + 1) * 50);
+  const pressed = pad.buttons[0]?.pressed ? ' · button 1' : '';
+  $('#pad-pct').textContent = pct + '%' + pressed;
+  $('#pad-pct').classList.toggle('mismatch', Math.abs(pct - boardPct) > 5);
+  $('#pad-bar').firstElementChild.style.width = pct + '%';
+  $('#pad-note').hidden = true;
+}
+requestAnimationFrame(pollGamepad);
+
+// ---- Sensor trace ----------------------------------------------------------
+
+let drawPending = false;
+
+function addSample(values) {
+  values.forEach((v, i) => {
+    trace[i].push(v);
+    if (trace[i].length > TRACE_SAMPLES) trace[i].shift();
+    $('#l' + (i + 1)).textContent = 'Sensor ' + (i + 1) + ': ' + v;
+  });
+  if (!drawPending) { drawPending = true; requestAnimationFrame(draw); }
+}
+
+function draw() {
+  drawPending = false;
+  const canvas = $('#trace');
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  if (canvas.width !== w * dpr || canvas.height !== h * dpr) {
+    canvas.width = w * dpr; canvas.height = h * dpr;
+  }
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+
+  const all = trace.flat();
+  if (!all.length) return;
+  let lo = Math.min(...all), hi = Math.max(...all);
+  const pad = Math.max(200, (hi - lo) * 0.1);
+  lo -= pad; hi += pad;
+
+  const css = getComputedStyle(document.documentElement);
+  ['--s1', '--s2', '--s3'].forEach((name, i) => {
+    const data = trace[i];
+    ctx.strokeStyle = css.getPropertyValue(name).trim();
+    ctx.lineWidth = 2;
+    ctx.lineJoin = 'round';
+    ctx.beginPath();
+    data.forEach((v, j) => {
+      const x = w - (data.length - 1 - j) * (w / (TRACE_SAMPLES - 1));
+      const y = h - ((v - lo) / (hi - lo)) * h;
+      j ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+    });
+    ctx.stroke();
+  });
+}
+window.addEventListener('resize', draw);
+
+// ---- Log -------------------------------------------------------------------
+
+function log(line) {
+  logLines.push(new Date().toLocaleTimeString() + '  ' + line);
+  if (logLines.length > LOG_LINES) logLines.shift();
+  const pre = $('#log');
+  const atBottom = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 4;
+  pre.textContent = logLines.join('\n');
+  if (atBottom) pre.scrollTop = pre.scrollHeight;
+}
+
+// ---- Wiring ----------------------------------------------------------------
+
+$('#connect').addEventListener('click', async () => {
+  if (port) return void closePort();
+  try {
+    await openPort(await navigator.serial.requestPort({ filters: [{ usbVendorId: CIRCUITPY_VID }] }));
+  } catch (e) {
+    if (e.name !== 'NotFoundError') showConnectError(e.message);  // NotFoundError = picker cancelled
+  }
+});
+
+document.querySelectorAll('.calibrate').forEach((b) =>
+  b.addEventListener('click', () => write('calibrate\r\n')));
+
+document.querySelectorAll('.restart').forEach((b) =>
+  b.addEventListener('click', async () => {
+    await write('\x03');                         // Ctrl+C: stop code.py
+    await new Promise((r) => setTimeout(r, 200));
+    await write('\x04');                         // Ctrl+D: run it again
+  }));
+
+if (!('serial' in navigator)) {
+  $('#connect').disabled = true;
+  $('#connect-help').textContent = "This browser can't use serial ports. Open this page in Chrome or Edge.";
+} else {
+  // Reconnect on its own to a board this page was already allowed to use,
+  // including after it resets (flash.bash).
+  const isBoard = (p) => p.getInfo().usbVendorId === CIRCUITPY_VID;
+  navigator.serial.getPorts().then((ports) => {
+    const p = ports.find(isBoard);
+    if (p && !port) openPort(p);
+  });
+  navigator.serial.addEventListener('connect', (e) => {
+    if (!port && isBoard(e.target)) openPort(e.target);
+  });
+  navigator.serial.addEventListener('disconnect', (e) => {
+    if (e.target === port) closePort();
+  });
+}
+</script>
+</body>
+</html>
